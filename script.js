@@ -31,8 +31,20 @@ document.addEventListener('DOMContentLoaded', () => {
     let lastDetectedSong = '';
     let lastArtworkQuery = '';
 
+    // Variables de control de reproducción y compatibilidad
+    let useCors = true;
+    let hlsInstance = null;
+    let playTimeout = null;
+    let isSimulatedVisualizer = false;
+    let isAudioConnected = false;
+    let bufferLength = 256;
+    let dataArray = new Uint8Array(bufferLength);
+    let isLoading = false;
+    let isSwitchingFallback = false;
+
     // --- Inicialización ---
     function init() {
+        setupAudioEventListeners();
         updateClock();
         setInterval(updateClock, 1000);
         fetchCurrentSong();
@@ -46,37 +58,247 @@ document.addEventListener('DOMContentLoaded', () => {
         lucide.createIcons();
     }
 
+    function setupAudioEventListeners() {
+        audioPlayer.addEventListener('play', () => {
+            isPlaying = true;
+            if (playTimeout) {
+                clearTimeout(playTimeout);
+                playTimeout = null;
+            }
+            setLoadingState(false);
+            updateUI();
+        });
+
+        audioPlayer.addEventListener('pause', () => {
+            isPlaying = false;
+            updateUI();
+            targetOpacity = 0;
+        });
+
+        audioPlayer.addEventListener('error', (e) => {
+            console.warn("Error del elemento de audio detectado:", e);
+            if (isPlaying || playTimeout) {
+                triggerCorsFallback();
+            }
+        });
+
+        audioPlayer.addEventListener('waiting', () => {
+            if (isPlaying) setLoadingState(true);
+        });
+
+        audioPlayer.addEventListener('playing', () => {
+            if (playTimeout) {
+                clearTimeout(playTimeout);
+                playTimeout = null;
+            }
+            setLoadingState(false);
+            
+            // Conectar el Web Audio API solo cuando comience a reproducirse y sea CORS
+            if (useCors && !isAudioConnected) {
+                connectWebAudio();
+            }
+            startVisualizer();
+        });
+    }
+
+    function connectWebAudio() {
+        try {
+            audioContext = new (window.AudioContext || window.webkitAudioContext)();
+            analyser = audioContext.createAnalyser();
+            analyser.fftSize = 512;
+            analyser.smoothingTimeConstant = 0.72;
+
+            gainNode = audioContext.createGain();
+            gainNode.gain.value = audioPlayer.volume;
+
+            const source = audioContext.createMediaElementSource(audioPlayer);
+            source.connect(gainNode);
+            gainNode.connect(analyser);
+            analyser.connect(audioContext.destination);
+
+            bufferLength = analyser.frequencyBinCount;
+            dataArray = new Uint8Array(bufferLength);
+            isAudioConnected = true;
+            console.log("Web Audio API conectado correctamente.");
+        } catch (err) {
+            console.warn("No se pudo conectar a Web Audio API (CORS o restricción):", err);
+            isSimulatedVisualizer = true;
+        }
+    }
+
     // --- Control de Audio ---
     playPauseButton.addEventListener('click', togglePlay);
 
     function togglePlay() {
         if (isPlaying) {
-            audioPlayer.pause();
-            // Limpiamos el src al pausar para que no siga almacenando buffer
-            audioPlayer.setAttribute('src', '');
-            audioPlayer.load();
-            isPlaying = false;
-            updateUI();
-            targetOpacity = 0;
+            stopPlayback();
         } else {
-            // Reasignamos el stream original con un timestamp para forzar el "VIVO"
-            const streamUrl = config.emisora.streaming_url;
-            audioPlayer.setAttribute('src', streamUrl + (streamUrl.includes('?') ? '&' : '?') + 't=' + Date.now());
-            audioPlayer.load();
-            audioPlayer.play().then(() => {
-                isPlaying = true;
-                updateUI();
-                startVisualizer();
-            }).catch(err => console.error("Error al reproducir:", err));
+            startPlayback();
         }
     }
 
-    audioPlayer.onplay = () => { isPlaying = true; updateUI(); startVisualizer(); };
-    audioPlayer.onpause = () => { isPlaying = false; updateUI(); targetOpacity = 0; };
+    function startPlayback() {
+        if (playTimeout) clearTimeout(playTimeout);
+        setLoadingState(true);
+
+        const streamUrl = config.emisora.streaming_url;
+        const isHls = streamUrl.toLowerCase().includes('.m3u8') || streamUrl.toLowerCase().includes('/hls/');
+        
+        // Configurar CORS
+        if (useCors) {
+            audioPlayer.setAttribute('crossorigin', 'anonymous');
+        } else {
+            audioPlayer.removeAttribute('crossorigin');
+        }
+
+        const timestampedUrl = streamUrl + (streamUrl.includes('?') ? '&' : '?') + 't=' + Date.now();
+
+        if (isHls) {
+            if (window.Hls && Hls.isSupported() && useCors) {
+                if (hlsInstance) hlsInstance.destroy();
+                hlsInstance = new Hls({
+                    enableWorker: true,
+                    lowLatencyMode: true,
+                    maxBufferSize: 0,
+                    maxBufferLength: 5
+                });
+                hlsInstance.loadSource(streamUrl);
+                hlsInstance.attachMedia(audioPlayer);
+                hlsInstance.on(Hls.Events.MANIFEST_PARSED, () => {
+                    audioPlayer.play().catch(handlePlayError);
+                });
+                hlsInstance.on(Hls.Events.ERROR, (event, data) => {
+                    console.warn("HLS Error:", data.type, data.details);
+                    if (data.fatal) {
+                        handlePlayError(new Error("HLS Fatal: " + data.details));
+                    }
+                });
+            } else {
+                audioPlayer.src = timestampedUrl;
+                audioPlayer.play().catch(handlePlayError);
+            }
+        } else {
+            audioPlayer.src = timestampedUrl;
+            audioPlayer.play().catch(handlePlayError);
+        }
+
+        // Timeout de carga (4 segundos)
+        playTimeout = setTimeout(() => {
+            if (audioPlayer.paused || audioPlayer.readyState < 2) {
+                console.warn("Carga lenta o bloqueada. Intentando fallback sin CORS...");
+                triggerCorsFallback();
+            }
+        }, 4000);
+    }
+
+    function stopPlayback() {
+        isPlaying = false;
+        setLoadingState(false);
+        updateUI();
+        targetOpacity = 0;
+
+        if (hlsInstance) {
+            hlsInstance.destroy();
+            hlsInstance = null;
+        }
+
+        audioPlayer.pause();
+        audioPlayer.src = '';
+        audioPlayer.load();
+
+        if (playTimeout) {
+            clearTimeout(playTimeout);
+            playTimeout = null;
+        }
+    }
+
+    function handlePlayError(err) {
+        if (err.name === 'AbortError') {
+            console.log("Reproducción abortada (esperado por reinicio de stream).");
+            return;
+        }
+        console.error("Error de reproducción:", err);
+        triggerCorsFallback();
+    }
+
+    function triggerCorsFallback() {
+        if (isSwitchingFallback) return;
+
+        if (playTimeout) {
+            clearTimeout(playTimeout);
+            playTimeout = null;
+        }
+
+        if (!useCors) {
+            console.error("El stream no está disponible en ningún modo.");
+            setLoadingState(false);
+            stopPlayback();
+            
+            const prevText = songTitleElement.innerHTML;
+            songTitleElement.innerHTML = "⚠️ SEÑAL NO DISPONIBLE ACTUALMENTE";
+            setTimeout(() => {
+                songTitleElement.innerHTML = prevText;
+            }, 5000);
+            return;
+        }
+
+        console.log("CORS ha fallado. Cambiando a modo sin CORS + Visualizador Simulado...");
+        isSwitchingFallback = true;
+        useCors = false;
+        isSimulatedVisualizer = true;
+        
+        // Reiniciar reproducción sin CORS en la misma instancia de audioPlayer
+        audioPlayer.pause();
+        audioPlayer.removeAttribute('crossorigin');
+        
+        const streamUrl = config.emisora.streaming_url;
+        const timestampedUrl = streamUrl + (streamUrl.includes('?') ? '&' : '?') + 't=' + Date.now();
+        audioPlayer.src = timestampedUrl;
+        audioPlayer.load();
+        
+        audioPlayer.play()
+            .then(() => {
+                isSwitchingFallback = false;
+            })
+            .catch((err) => {
+                isSwitchingFallback = false;
+                handlePlayError(err);
+            });
+    }
+
+    function setLoadingState(loading) {
+        isLoading = loading;
+        const icon = playPauseButton.querySelector('i') || playPauseButton.querySelector('svg');
+        if (icon) {
+            if (isLoading) {
+                icon.setAttribute('data-lucide', 'loader-2');
+                icon.style.animation = 'spin 1.2s linear infinite';
+            } else {
+                icon.style.animation = '';
+                icon.setAttribute('data-lucide', isPlaying ? 'pause' : 'play');
+            }
+            lucide.createIcons();
+        }
+
+        const liveIndicator = document.querySelector('.live-indicator');
+        const liveDot = document.querySelector('.live-dot');
+        if (liveIndicator) {
+            if (isLoading) {
+                liveIndicator.childNodes[0].textContent = 'CONECTANDO... ';
+                if (liveDot) liveDot.style.display = 'none';
+            } else if (isPlaying) {
+                liveIndicator.childNodes[0].textContent = 'EN VIVO ';
+                if (liveDot) liveDot.style.display = 'inline-block';
+            } else {
+                liveIndicator.childNodes[0].textContent = 'PAUSADO ';
+                if (liveDot) liveDot.style.display = 'none';
+            }
+        }
+    }
 
     function updateUI() {
         const icon = playPauseButton.querySelector('i') || playPauseButton.querySelector('svg');
-        if (icon) {
+        if (icon && !isLoading) {
             icon.setAttribute('data-lucide', isPlaying ? 'pause' : 'play');
             lucide.createIcons();
         }
@@ -90,13 +312,14 @@ document.addEventListener('DOMContentLoaded', () => {
         targetOpacity = vol == 0 ? 0 : Math.max(0.2, vol);
     });
 
-    // --- Visualizador (Onda Suave) ---
-    let audioContext, analyser, gainNode, dataArray, bufferLength, canvas, ctx;
+    // --- Visualizador (Onda Suave y Simulación) ---
+    let audioContext, analyser, gainNode, canvas, ctx;
     let visualizerStarted = false;
     let visualOpacity = 0;
     let targetOpacity = 0;
     let smoothEnergy = 0;
     let visualMemoryLevel = 20; // Inercia visual persistente
+    let simTime = 0;
 
     function startVisualizer() {
         if (visualizerStarted) {
@@ -113,36 +336,69 @@ document.addEventListener('DOMContentLoaded', () => {
         resizeCanvas();
         window.onresize = resizeCanvas;
 
-        audioContext = new (window.AudioContext || window.webkitAudioContext)();
-        analyser = audioContext.createAnalyser();
-        analyser.fftSize = 512; 
-        analyser.smoothingTimeConstant = 0.72; // Picos más nerviosos y reactivos
-        
-        gainNode = audioContext.createGain();
-        gainNode.gain.value = audioPlayer.volume;
-
-        const source = audioContext.createMediaElementSource(audioPlayer);
-        source.connect(gainNode);
-        gainNode.connect(analyser); 
-        analyser.connect(audioContext.destination);
-
-        bufferLength = analyser.frequencyBinCount;
-        dataArray = new Uint8Array(bufferLength);
-
         draw();
     }
 
     function resizeCanvas() {
         if (!canvas) return;
         canvas.width = window.innerWidth;
-        canvas.height = 600; 
+        canvas.height = 600;
+    }
+
+    function fillSimulatedData() {
+        if (!isPlaying) {
+            for (let i = 0; i < bufferLength; i++) {
+                dataArray[i] = Math.max(0, dataArray[i] - 6);
+            }
+            return;
+        }
+
+        simTime += 0.045;
+        
+        // Simular pulso de bajos (rango 120-130 BPM)
+        const beat = Math.pow(Math.max(0, Math.sin(simTime * 2.5)), 4);
+        
+        const bassBase = 120 + Math.sin(simTime * 4) * 30 + beat * 70;
+        const midBase = 90 + Math.sin(simTime * 2.5) * 25 + Math.cos(simTime * 5.5) * 15;
+        const highBase = 45 + Math.sin(simTime * 7) * 15 + Math.random() * 10;
+
+        for (let i = 0; i < bufferLength; i++) {
+            let val = 0;
+            const percent = i / bufferLength;
+            
+            if (percent < 0.18) {
+                // Bajos
+                const progress = percent / 0.18;
+                val = bassBase * (1.0 - progress * 0.25) + Math.random() * 15;
+            } else if (percent < 0.55) {
+                // Medios
+                const progress = (percent - 0.18) / 0.37;
+                val = midBase * (1.0 - progress * 0.35) + Math.sin(simTime * 10 + i) * 12 + Math.random() * 12;
+            } else {
+                // Agudos
+                const progress = (percent - 0.55) / 0.45;
+                val = highBase * (1.0 - progress * 0.75) + Math.sin(simTime * 18 + i * 1.5) * 8 + Math.random() * 8;
+            }
+            
+            // Responder al volumen
+            const currentVolume = audioPlayer ? audioPlayer.volume : 1;
+            val = val * Math.min(1, currentVolume * 1.3);
+
+            const targetVal = Math.max(8, Math.min(255, val));
+            dataArray[i] = dataArray[i] * 0.75 + targetVal * 0.25; // suavizado de transición
+        }
     }
 
     function draw() {
         requestAnimationFrame(draw);
-        if (!analyser || !ctx) return;
+        if (!ctx) return;
 
-        analyser.getByteFrequencyData(dataArray);
+        if (analyser && !isSimulatedVisualizer) {
+            analyser.getByteFrequencyData(dataArray);
+        } else {
+            fillSimulatedData();
+        }
+
         const width = canvas.width;
         const height = canvas.height;
 
